@@ -23,20 +23,28 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from . import analysis, ffmpeg, graph, jobs
-from .models import AnalyzeResponse, EditRequest, SegmentOut
+try:
+    from . import analysis, ffmpeg, graph, jobs
+    from .models import AnalyzeResponse, EditRequest, SegmentOut
+except ImportError:
+    import analysis, ffmpeg, graph, jobs
+    from models import AnalyzeResponse, EditRequest, SegmentOut
 
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE = BASE_DIR / "storage"
 UPLOADS = STORAGE / "uploads"
 OUTPUTS = STORAGE / "outputs"
+IMAGES = STORAGE / "images"
 
 ALLOWED_SUFFIXES = {
     ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".mpg", ".mpeg",
     ".ts", ".wmv", ".flv", ".3gp", ".m2ts", ".mts", ".ogv", ".gif",
 }
 
+ALLOWED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024 * 1024  # 8 GB
+MAX_IMAGE_BYTES = 32 * 1024 * 1024  # 32 MB
 
 app = FastAPI(title="Video Editor API", version="1.0.0")
 
@@ -51,7 +59,7 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup() -> None:
-    for folder in (UPLOADS, OUTPUTS):
+    for folder in (UPLOADS, OUTPUTS, IMAGES):
         folder.mkdir(parents=True, exist_ok=True)
     jobs.manager.start(workers=2)
 
@@ -332,6 +340,112 @@ def health() -> dict[str, Any]:
 @app.delete("/api/asset/{asset_id}")
 def delete_asset(asset_id: str) -> JSONResponse:
     path = _asset_path(asset_id)
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return JSONResponse({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# Images (overlays)
+# --------------------------------------------------------------------------
+
+def _image_path(image_id: str) -> Path:
+    """Resolve an image id to a file, refusing anything path-like."""
+    if not image_id.isalnum():
+        raise HTTPException(400, "bad image id")
+    matches = list(IMAGES.glob(f"{image_id}.*"))
+    if not matches:
+        raise HTTPException(404, "unknown image")
+    return matches[0]
+
+
+class ImageResponse(BaseModel):
+    image_id: str
+    filename: str
+    width: int
+    height: int
+    size: int
+
+
+@app.post("/api/upload-image", response_model=ImageResponse)
+async def upload_image(file: UploadFile) -> ImageResponse:
+    """Store a still image so a render can reference it by id.
+
+    The browser keeps using its own object URL for the live preview; this copy
+    only exists so FFmpeg has a path to read during the export.
+    """
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in ALLOWED_IMAGE_SUFFIXES:
+        raise HTTPException(
+            400, f"unsupported image type '{suffix}'. Allowed: "
+                 + ", ".join(sorted(ALLOWED_IMAGE_SUFFIXES))
+        )
+
+    image_id = uuid.uuid4().hex[:16]
+    target = IMAGES / f"{image_id}{suffix}"
+
+    written = 0
+    with target.open("wb") as fh:
+        while chunk := await file.read(1024 * 1024):
+            written += len(chunk)
+            if written > MAX_IMAGE_BYTES:
+                fh.close()
+                target.unlink(missing_ok=True)
+                raise HTTPException(413, "that image is too large (32 MB max)")
+            fh.write(chunk)
+
+    if written == 0:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, "the uploaded file was empty")
+
+    try:
+        info = ffmpeg.media_info(target)
+    except ffmpeg.FFmpegError as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, f"could not read that image: {exc}") from exc
+
+    width = info.display_width or info.width
+    height = info.display_height or info.height
+    if not width or not height:
+        target.unlink(missing_ok=True)
+        raise HTTPException(400, "that file is not a readable image")
+
+    # The stored name, not the one the browser sent, so this agrees with
+    # `GET /api/image/{id}` and with what `/file` actually serves. The UI keeps
+    # the original name in its own layer list.
+    return ImageResponse(
+        image_id=image_id,
+        filename=target.name,
+        width=width,
+        height=height,
+        size=written,
+    )
+
+
+@app.get("/api/image/{image_id}")
+def image_info(image_id: str) -> dict[str, Any]:
+    path = _image_path(image_id)
+    info = ffmpeg.media_info(path)
+    return {
+        "image_id": image_id,
+        "filename": path.name,
+        "width": info.display_width or info.width,
+        "height": info.display_height or info.height,
+        "size": path.stat().st_size,
+    }
+
+
+@app.get("/api/image/{image_id}/file")
+def image_file(image_id: str) -> FileResponse:
+    path = _image_path(image_id)
+    return FileResponse(path, filename=path.name)
+
+
+@app.delete("/api/image/{image_id}")
+def delete_image(image_id: str) -> JSONResponse:
+    path = _image_path(image_id)
     try:
         path.unlink()
     except OSError as exc:

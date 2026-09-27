@@ -15,8 +15,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from . import analysis, encoder, ffmpeg, graph
-from .models import EditRequest
+try:
+    from . import analysis, encoder, ffmpeg, graph
+    from .models import EditRequest
+except ImportError:
+    import analysis, encoder, ffmpeg, graph
+    from models import EditRequest
 
 JobStatus = Literal["queued", "analyzing", "rendering", "done", "error", "cancelled"]
 

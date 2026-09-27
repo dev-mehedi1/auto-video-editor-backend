@@ -156,6 +156,45 @@ class ExportSettings(BaseModel):
     filename: str = ""
 
 
+class Overlay(BaseModel):
+    """A draggable element on the output frame.
+
+    Position and size are centre-anchored fractions of the output frame rather
+    than the nine-slot grid the legacy watermark uses, because a drag handle
+    manipulates a centre directly. `font_size` is authored against a 1920-wide
+    frame, matching TextSettings, so the browser preview and the render agree on
+    how big the text ends up.
+    """
+
+    id: str = ""
+    kind: Literal["image", "text"] = "image"
+    # Server-side image id from POST /api/upload-image. Ignored for text.
+    image_id: str = ""
+    text: str = ""
+    # Centre, as a fraction of the output width/height.
+    x: float = Field(0.5, ge=-1.0, le=2.0)
+    y: float = Field(0.5, ge=-1.0, le=2.0)
+    # Box size as a fraction of the output width/height. The image is fitted
+    # inside this box and centred, which is what object-contain does in the
+    # preview, so the two stay in step.
+    width_pct: float = Field(0.3, ge=0.01, le=3.0)
+    height_pct: float = Field(0.3, ge=0.01, le=3.0)
+    # Timing in OUTPUT seconds, because overlays are placed against the
+    # finished video, not the source.
+    start: float = Field(0.0, ge=0.0, le=86400.0)
+    duration: float = Field(3.0, ge=0.02, le=3600.0)
+    opacity: float = Field(1.0, ge=0.0, le=1.0)
+    rotation: float = Field(0.0, ge=-180.0, le=180.0)
+    # Text styling
+    font_file: str = "C:/Windows/Fonts/arial.ttf"
+    font_size: int = Field(64, ge=8, le=400)
+    color: str = "#FFFFFF"
+    outline_color: str = "#000000"
+    outline_width: int = Field(3, ge=0, le=20)
+    box: bool = True
+    box_color: str = "#000000AA"
+
+
 class EditRequest(BaseModel):
     asset_id: str
     auto_cut: AutoCutSettings = Field(default_factory=AutoCutSettings)
@@ -166,6 +205,8 @@ class EditRequest(BaseModel):
     export: ExportSettings = Field(default_factory=ExportSettings)
     # Optional manual override; when present the VAD result is ignored.
     manual_segments: list[list[float]] | None = None
+    # Draggable photos and text, placed in output time.
+    overlays: list[Overlay] = Field(default_factory=list)
 
 
 class AnalyzeRequest(BaseModel):

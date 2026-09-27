@@ -3,8 +3,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .graph import Plan
-from .models import EditRequest, ExportSettings
+try:
+    from .graph import Plan
+    from .models import EditRequest, ExportSettings
+except ImportError:
+    from graph import Plan
+    from models import EditRequest, ExportSettings
+
 
 # video_codec -> (ffmpeg encoder, default container extension, pixel format)
 VIDEO_CODECS: dict[str, tuple[str, str, str]] = {
@@ -117,7 +122,11 @@ def render(
     cancel=None,
 ) -> None:
     """Run the render, streaming progress back to the caller."""
-    from . import ffmpeg, graph
+    try:
+        from . import ffmpeg, graph
+    except ImportError:
+        import ffmpeg, graph
+
 
     try:
         ffmpeg.run_with_progress(

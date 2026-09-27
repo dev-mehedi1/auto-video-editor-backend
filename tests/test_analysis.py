@@ -254,5 +254,6 @@ check("stats_to_dict drops the envelope by default", "envelope" not in d, list(d
 check("stats_to_dict can still include it", "envelope" in stats_to_dict(st_full, True))
 
 
-print(f"\n{PASS} passed, {FAIL} failed")
-sys.exit(1 if FAIL else 0)
+if __name__ == "__main__":
+    print(f"\n{PASS} passed, {FAIL} failed")
+    sys.exit(1 if FAIL else 0)

@@ -304,6 +304,99 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.delete(f"/api/asset/{asset_id}").status_code, 200)
         self.assertEqual(self.client.get(f"/api/asset/{asset_id}").status_code, 404)
 
+    # -- image overlays ---------------------------------------------------
+
+    def _png(self) -> bytes:
+        path = self._dir / "still.png"
+        ffmpeg.run([
+            "-v", "error", "-y", "-f", "lavfi",
+            "-i", "color=c=red:s=200x140:d=1", "-frames:v", "1", str(path),
+        ], capture_stdout=False)
+        return path.read_bytes()
+
+    def _upload_image(self, name: str = "photo.png") -> dict:
+        r = self.client.post(
+            "/api/upload-image",
+            files={"file": (name, self._png(), "image/png")},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_upload_image(self) -> None:
+        body = self._upload_image()
+        self.addCleanup(self.client.delete, f"/api/image/{body['image_id']}")
+        self.assertTrue(body["image_id"].isalnum())
+        self.assertEqual((body["width"], body["height"]), (200, 140))
+        self.assertGreater(body["size"], 0)
+        self.assertEqual(body["filename"], f"{body['image_id']}.png")
+
+    def test_image_metadata_matches_upload(self) -> None:
+        body = self._upload_image()
+        self.addCleanup(self.client.delete, f"/api/image/{body['image_id']}")
+        got = self.client.get(f"/api/image/{body['image_id']}").json()
+        self.assertEqual(got, body)
+
+    def test_image_file_downloads_the_bytes(self) -> None:
+        body = self._upload_image()
+        self.addCleanup(self.client.delete, f"/api/image/{body['image_id']}")
+        r = self.client.get(f"/api/image/{body['image_id']}/file")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.content[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_delete_image(self) -> None:
+        body = self._upload_image()
+        image_id = body["image_id"]
+        self.assertEqual(self.client.delete(f"/api/image/{image_id}").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/image/{image_id}").status_code, 404)
+
+    def test_image_rejects_unsupported_type(self) -> None:
+        r = self.client.post(
+            "/api/upload-image",
+            files={"file": ("notes.txt", b"hello", "text/plain")},
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_image_rejects_empty_file(self) -> None:
+        r = self.client.post(
+            "/api/upload-image", files={"file": ("empty.png", b"", "image/png")},
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_image_rejects_path_traversal(self) -> None:
+        self.assertEqual(self.client.get("/api/image/..%2F..%2Fetc").status_code in (400, 404), True)
+
+    def test_unknown_image_is_404(self) -> None:
+        self.assertEqual(self.client.get("/api/image/deadbeefdeadbeef").status_code, 404)
+
+    def test_render_with_an_image_overlay(self) -> None:
+        body = self._upload_image()
+        self.addCleanup(self.client.delete, f"/api/image/{body['image_id']}")
+        status = self._render({
+            "asset_id": self.upload["asset_id"],
+            "auto_cut": {"enabled": False},
+            "overlays": [{
+                "kind": "image", "image_id": body["image_id"],
+                "x": 0.5, "y": 0.5, "width_pct": 0.4, "height_pct": 0.4,
+                "start": 0.0, "duration": 1.0,
+            }],
+            "export": {"preset": "ultrafast", "crf": 32, "filename": "with-photo"},
+        })
+        self.assertEqual(status["status"], "done", status.get("error"))
+        self.assertGreater(status["output_size"], 0)
+
+    def test_render_with_a_text_overlay(self) -> None:
+        status = self._render({
+            "asset_id": self.upload["asset_id"],
+            "auto_cut": {"enabled": False},
+            "overlays": [{
+                "kind": "text", "text": "Dragged title",
+                "x": 0.5, "y": 0.5, "start": 0.0, "duration": 1.0, "font_size": 60,
+            }],
+            "export": {"preset": "ultrafast", "crf": 32, "filename": "with-text"},
+        })
+        self.assertEqual(status["status"], "done", status.get("error"))
+        self.assertGreater(status["output_size"], 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -11,11 +11,11 @@ through a Vite proxy, so it never needs CORS in normal development.
 
 ## Requirements
 
-| Tool | Version tested | Notes |
-|------|----------------|-------|
-| Python | 3.13.5 | 3.10+ should work |
-| FFmpeg | 8.1.2 | must be on `PATH`, with `ffprobe` next to it |
-| Node.js | not needed | only the frontend uses it |
+| Tool    | Version tested | Notes                                        |
+| ------- | -------------- | -------------------------------------------- |
+| Python  | 3.13.5         | 3.10+ should work                            |
+| FFmpeg  | 8.1.2          | must be on `PATH`, with `ffprobe` next to it |
+| Node.js | not needed     | only the frontend uses it                    |
 
 Check FFmpeg before anything else:
 
@@ -128,8 +128,12 @@ A healthy response:
   "ok": true,
   "ffmpeg": "ffmpeg",
   "encoders": {
-    "libx264": true, "libx265": true, "libvpx-vp9": true,
-    "aac": true, "libmp3lame": true, "libopus": true
+    "libx264": true,
+    "libx265": true,
+    "libvpx-vp9": true,
+    "aac": true,
+    "libmp3lame": true,
+    "libopus": true
   },
   "aspects": ["16:9", "1:1", "21:9", "4:3", "4:5", "9:16"],
   "xfades": ["circleclose", "circleopen", "dissolve", "fade", "..."]
@@ -170,19 +174,19 @@ leftovers are expected and safe to delete.
 
 ## API
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET` | `/api/health` | readiness, ffmpeg path, encoder support |
-| `POST` | `/api/upload` | upload a source clip, returns an `asset_id` |
-| `GET` | `/api/asset/{id}` | metadata: duration, size, fps, codecs, rotation |
-| `GET` | `/api/asset/{id}/file` | download the original upload |
-| `GET` | `/api/asset/{id}/waveform` | peak envelope for the timeline |
-| `POST` | `/api/analyze` | silence detection, returns keep/drop segments |
-| `POST` | `/api/render` | queue a render, returns a `job_id` |
-| `GET` | `/api/job/{id}` | poll job status and progress |
-| `POST` | `/api/job/{id}/cancel` | cancel a queued or running job |
-| `GET` | `/api/job/{id}/file` | download the finished render |
-| `DELETE` | `/api/asset/{id}` | delete an upload |
+| Method   | Path                       | Purpose                                         |
+| -------- | -------------------------- | ----------------------------------------------- |
+| `GET`    | `/api/health`              | readiness, ffmpeg path, encoder support         |
+| `POST`   | `/api/upload`              | upload a source clip, returns an `asset_id`     |
+| `GET`    | `/api/asset/{id}`          | metadata: duration, size, fps, codecs, rotation |
+| `GET`    | `/api/asset/{id}/file`     | download the original upload                    |
+| `GET`    | `/api/asset/{id}/waveform` | peak envelope for the timeline                  |
+| `POST`   | `/api/analyze`             | silence detection, returns keep/drop segments   |
+| `POST`   | `/api/render`              | queue a render, returns a `job_id`              |
+| `GET`    | `/api/job/{id}`            | poll job status and progress                    |
+| `POST`   | `/api/job/{id}/cancel`     | cancel a queued or running job                  |
+| `GET`    | `/api/job/{id}/file`       | download the finished render                    |
+| `DELETE` | `/api/asset/{id}`          | delete an upload                                |
 
 Renders are asynchronous: `POST /api/render` returns immediately with a
 `job_id`, then you poll `/api/job/{id}` until `status` is `done`, and fetch
@@ -196,9 +200,9 @@ frontend from somewhere else.
 
 ## Configuration
 
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `FFMPEG_BINARY` | `ffmpeg` | full path to the ffmpeg executable |
+| Variable         | Default   | Purpose                             |
+| ---------------- | --------- | ----------------------------------- |
+| `FFMPEG_BINARY`  | `ffmpeg`  | full path to the ffmpeg executable  |
 | `FFPROBE_BINARY` | `ffprobe` | full path to the ffprobe executable |
 
 If FFmpeg is not on your `PATH`:
@@ -206,7 +210,7 @@ If FFmpeg is not on your `PATH`:
 ```powershell
 $env:FFMPEG_BINARY  = "C:\ffmpeg\bin\ffmpeg.exe"
 $env:FFPROBE_BINARY = "C:\ffmpeg\bin\ffprobe.exe"
-python -m uvicorn Backend.main:app --port 8000
+python -m uvicorn main:app --port 8000
 ```
 
 Uploads are capped at 8 GB. Accepted containers: `.mp4 .mov .mkv .avi .webm

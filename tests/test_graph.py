@@ -21,6 +21,7 @@ from ..models import (
     AutoCutSettings,
     EditRequest,
     ExportSettings,
+    Overlay,
     TextSettings,
     TransitionSettings,
     VideoSettings,
@@ -100,6 +101,18 @@ def _make_srt(path: Path) -> Path:
         encoding="utf-8",
     )
     return path
+
+
+def _make_overlay_photo(path: Path, colour: str = "red") -> Path:
+    """A flat coloured PNG, so a rendered frame can be checked for its presence."""
+    ffmpeg.run([
+        "-f", "lavfi", "-i", f"color=c={colour}:s=200x140:d=1",
+        "-frames:v", "1", str(path),
+    ], capture_stdout=False)
+    return path
+
+
+FONT = Path("C:/Windows/Fonts/arial.ttf")
 
 
 @unittest.skipUnless(FFMPEG_OK, "ffmpeg binary not available")
@@ -394,6 +407,187 @@ class GraphRenderTests(unittest.TestCase):
         ))
         out = self._render(req)
         self.assertTrue(ffmpeg.media_info(out).has_video)
+
+    # -- draggable overlays ------------------------------------------------
+
+    def test_image_overlay_renders(self) -> None:
+        photo = _make_overlay_photo(self.tmp / "ov.png", "red")
+        image_id = self._store_image(photo)
+        req = self._request(overlays=[Overlay(
+            kind="image", image_id=image_id, x=0.5, y=0.5,
+            width_pct=0.4, height_pct=0.4, start=0.0, duration=2.0,
+        )])
+        out = self._render(req)
+        info = ffmpeg.media_info(out)
+        self.assertTrue(info.has_video)
+        self.assertGreater(info.duration, 0.1)
+
+    def test_image_overlay_position_moves_the_pixels(self) -> None:
+        """The whole point of the drag handle: position has to actually move."""
+        photo = _make_overlay_photo(self.tmp / "ov_pos.png", "red")
+        image_id = self._store_image(photo)
+
+        def corner_red(x: float, y: float) -> float:
+            """Red channel of the top-left corner when the photo is at (x, y)."""
+            req = self._request(overlays=[Overlay(
+                kind="image", image_id=image_id, x=x, y=y,
+                width_pct=0.5, height_pct=0.5, start=0.0, duration=2.0,
+            )])
+            out = self._render(req, segments=[(0.0, 1.0)])
+            return self._red_score(out)
+
+        # The source is 0x203040 (red 32), so a red corner means the photo is
+        # there. Compare the two placements rather than using a hard cutoff:
+        # H.264 bleeds a little chroma at the frame edge.
+        top_left = corner_red(0.25, 0.25)
+        bottom_right = corner_red(0.75, 0.75)
+        self.assertGreater(top_left, 100.0, f"photo missing from top-left: {top_left}")
+        self.assertLess(
+            bottom_right, 90.0, f"photo still in the top-left corner: {bottom_right}"
+        )
+        self.assertGreater(
+            top_left - bottom_right, 60.0,
+            f"moving the photo barely changed the corner: {top_left} vs {bottom_right}",
+        )
+
+    def test_image_overlay_opacity(self) -> None:
+        photo = _make_overlay_photo(self.tmp / "ov_op.png", "red")
+        image_id = self._store_image(photo)
+        req = self._request(overlays=[Overlay(
+            kind="image", image_id=image_id, x=0.5, y=0.5,
+            width_pct=0.8, height_pct=0.8, start=0.0, duration=2.0,
+            opacity=0.3,
+        )])
+        out = self._render(req, segments=[(0.0, 1.0)])
+        self.assertTrue(ffmpeg.media_info(out).has_video)
+
+    def test_image_overlay_rotation(self) -> None:
+        photo = _make_overlay_photo(self.tmp / "ov_rot.png", "red")
+        image_id = self._store_image(photo)
+        req = self._request(overlays=[Overlay(
+            kind="image", image_id=image_id, x=0.5, y=0.5,
+            width_pct=0.5, height_pct=0.5, start=0.0, duration=2.0,
+            rotation=35.0,
+        )])
+        out = self._render(req, segments=[(0.0, 1.0)])
+        self.assertTrue(ffmpeg.media_info(out).has_video)
+
+    def test_image_overlay_time_window(self) -> None:
+        """A late overlay must not touch the first frame."""
+        photo = _make_overlay_photo(self.tmp / "ov_late.png", "red")
+        image_id = self._store_image(photo)
+        req = self._request(overlays=[Overlay(
+            kind="image", image_id=image_id, x=0.5, y=0.5,
+            width_pct=0.9, height_pct=0.9, start=3.0, duration=2.0,
+        )])
+        out = self._render(req, segments=[(0.0, 4.0)])
+        self.assertTrue(ffmpeg.media_info(out).has_video)
+
+    def test_text_overlay_renders(self) -> None:
+        if not FONT.exists():
+            self.skipTest("arial.ttf not available")
+        req = self._request(overlays=[Overlay(
+            kind="text", text="Dragged title", x=0.5, y=0.5,
+            start=0.0, duration=2.0, font_size=60,
+        )])
+        out = self._render(req)
+        self.assertTrue(ffmpeg.media_info(out).has_video)
+
+    def test_text_overlay_special_characters(self) -> None:
+        if not FONT.exists():
+            self.skipTest("arial.ttf not available")
+        req = self._request(overlays=[Overlay(
+            kind="text", text='a,b: 100% [x] \'q\' \\ end', x=0.5, y=0.4,
+            start=0.0, duration=2.0, font_size=36,
+        )])
+        out = self._render(req)
+        self.assertTrue(ffmpeg.media_info(out).has_video)
+
+    def test_overlay_missing_image_is_a_warning_not_a_failure(self) -> None:
+        req = self._request(overlays=[Overlay(
+            kind="image", image_id="deadbeefdeadbeef", x=0.5, y=0.5,
+        )])
+        plan = graph.build(req, self.info, [(0.0, 1.0)], self.info.duration)
+        self.assertTrue(any("no longer exists" in w for w in plan.warnings))
+
+    def test_overlay_empty_list_changes_nothing(self) -> None:
+        req = self._request(overlays=[])
+        out = self._render(req)
+        self.assertTrue(ffmpeg.media_info(out).has_video)
+
+    def test_overlay_text_temp_file_is_cleaned(self) -> None:
+        if not FONT.exists():
+            self.skipTest("arial.ttf not available")
+        req = self._request(overlays=[Overlay(
+            kind="text", text="cleanup", font_size=40,
+        )])
+        plan = graph.build(req, self.info, [(0.0, 1.0)], self.info.duration)
+        self.assertTrue(plan.cleanup_paths)
+        created = [Path(p) for p in plan.cleanup_paths]
+        self.assertTrue(all(p.exists() for p in created))
+        graph.cleanup(plan)
+        self.assertFalse(any(p.exists() for p in created))
+
+    def test_image_overlay_and_text_overlay_together(self) -> None:
+        if not FONT.exists():
+            self.skipTest("arial.ttf not available")
+        photo = _make_overlay_photo(self.tmp / "ov_both.png", "blue")
+        image_id = self._store_image(photo)
+        req = self._request(overlays=[
+            Overlay(kind="image", image_id=image_id, x=0.3, y=0.3,
+                    width_pct=0.25, height_pct=0.25, duration=2.0),
+            Overlay(kind="text", text="Both at once", x=0.5, y=0.8,
+                    duration=2.0, font_size=48),
+        ])
+        out = self._render(req)
+        self.assertTrue(ffmpeg.media_info(out).has_video)
+
+    def test_overlay_survives_a_vertical_reframe(self) -> None:
+        """x/y must address the delivery frame, not the source frame."""
+        photo = _make_overlay_photo(self.tmp / "ov_916.png", "red")
+        image_id = self._store_image(photo)
+        req = self._request(
+            video=VideoSettings(aspect="9:16", fit="fit"),
+            overlays=[Overlay(
+                kind="image", image_id=image_id, x=0.5, y=0.5,
+                width_pct=0.6, height_pct=0.2, start=0.0, duration=2.0,
+            )],
+        )
+        plan = graph.build(req, self.info, [(0.0, 1.0)], self.info.duration)
+        self.assertEqual((plan.width, plan.height), (1080, 1920))
+        # 60% of the 1080-wide delivery frame, not of the source width.
+        self.assertIn("648", plan.filter_complex)
+
+    def _store_image(self, path: Path) -> str:
+        """Copy a photo into the image store and return its id.
+
+        Ids must be alphanumeric, so a counter is used rather than the
+        filename, which carries underscores.
+        """
+        image_root = graph.IMAGE_ROOT
+        image_root.mkdir(parents=True, exist_ok=True)
+        self._image_seq = getattr(self, "_image_seq", 0) + 1
+        image_id = f"testimg{self._image_seq:04d}"
+        target = image_root / f"{image_id}{path.suffix}"
+        shutil.copy2(path, target)
+        self.addCleanup(target.unlink, missing_ok=True)
+        return image_id
+
+    def _red_score(self, video: Path) -> float:
+        """Red channel of one frame's top-left corner, as a 'is the photo there' probe.
+
+        Raw bytes go to a file rather than stdout: `ffmpeg.run` hands back text,
+        which mangles anything that is not valid utf-8.
+        """
+        raw = self.tmp / f"probe_{self._testMethodName}.raw"
+        ffmpeg.run([
+            "-i", str(video), "-frames:v", "1",
+            "-vf", "crop=iw/4:ih/4:0:0,scale=1:1",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-y", str(raw),
+        ], capture_stdout=False)
+        data = raw.read_bytes()
+        raw.unlink(missing_ok=True)
+        return float(data[0]) if len(data) >= 3 else 0.0
 
     # -- colour -----------------------------------------------------------
 

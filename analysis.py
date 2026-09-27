@@ -22,7 +22,10 @@ from dataclasses import dataclass, asdict, field
 
 import numpy as np
 
-from . import ffmpeg
+try:
+    from . import ffmpeg
+except ImportError:
+    import ffmpeg
 
 EPS = 1e-10
 FLOOR_DB = -100.0

@@ -24,15 +24,29 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .ffmpeg import MediaInfo
-from .models import (
-    AudioSettings,
-    EditRequest,
-    TextSettings,
-    VideoSettings,
-    XfadeTransition,
-    ZoomStyle,
-)
+try:
+    from .ffmpeg import MediaInfo
+    from .models import (
+        AudioSettings,
+        EditRequest,
+        Overlay,
+        TextSettings,
+        VideoSettings,
+        XfadeTransition,
+        ZoomStyle,
+    )
+except ImportError:
+    from ffmpeg import MediaInfo
+    from models import (
+        AudioSettings,
+        EditRequest,
+        Overlay,
+        TextSettings,
+        VideoSettings,
+        XfadeTransition,
+        ZoomStyle,
+    )
+
 
 ASPECTS: dict[str, tuple[int, int]] = {
     "16:9": (1920, 1080),
@@ -42,6 +56,9 @@ ASPECTS: dict[str, tuple[int, int]] = {
     "21:9": (2560, 1080),
     "4:3": (1440, 1080),
 }
+
+# Where uploaded overlay photos live. Kept in step with main.IMAGE_ROOT.
+IMAGE_ROOT = Path(__file__).resolve().parent / "storage" / "images"
 
 RESOLUTIONS: dict[str, int] = {
     "2160p": 2160, "1440p": 1440, "1080p": 1080,
@@ -484,6 +501,172 @@ def _caption_chain(text: TextSettings, out_w: int, out_h: int) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Overlays
+# --------------------------------------------------------------------------
+
+def _overlay_box(overlay: Overlay, out_w: int, out_h: int) -> tuple[int, int]:
+    """The box an overlay is fitted into, in output pixels."""
+    return (
+        max(2, int(round(overlay.width_pct * out_w))),
+        max(2, int(round(overlay.height_pct * out_h))),
+    )
+
+
+def _overlay_enable(overlay: Overlay) -> str:
+    """The between() window an overlay is visible for.
+
+    Commas have to be escaped or the graph parser reads them as chain
+    separators and goes looking for a filter named "3.000".
+    """
+    end = overlay.start + overlay.duration
+    return f"between(t\\,{overlay.start:.3f}\\,{end:.3f})"
+
+
+def _image_overlay_chain(
+    overlay: Overlay, input_index: int, out_w: int, out_h: int, label: str
+) -> str:
+    """Build `[idx:v]<prepare>[label]` for one photo overlay.
+
+    `force_original_aspect_ratio=decrease` fits the photo inside the box, which
+    is exactly what `object-contain` does in the browser preview, so a photo
+    dragged to a size lands in the same place in both.
+    """
+    box_w, box_h = _overlay_box(overlay, out_w, out_h)
+    parts = [f"scale={box_w}:{box_h}:force_original_aspect_ratio=decrease:flags=bicubic"]
+
+    if abs(overlay.rotation) > 0.01:
+        rad = overlay.rotation * 3.141592653589793 / 180.0
+        # c=none keeps the frame transparent, and rotw/roth grow the canvas to
+        # fit the rotated corners so nothing is clipped away.
+        parts.append(f"rotate={rad:.6f}:c=none:ow=rotw(ih):oh=roth(ih)")
+
+    parts.append("format=rgba")
+    if overlay.opacity < 0.999:
+        parts.append(f"colorchannelmixer=aa={overlay.opacity:.3f}")
+
+    return f"[{input_index}:v]{','.join(parts)}[{label}]"
+
+
+def _text_overlay_chain(
+    overlay: Overlay, out_w: int, out_h: int
+) -> tuple[str, str] | None:
+    """Build a drawtext filter for one text overlay, plus its temp file.
+
+    Returns None when there is nothing drawable. Like the legacy title, the
+    string goes through `textfile=` so no amount of escaping can be eaten by the
+    filtergraph parser.
+    """
+    if not overlay.text.strip() or not Path(overlay.font_file).exists():
+        return None
+
+    size = max(10, int(round(overlay.font_size * out_w / 1920.0)))
+
+    handle, txt_path = tempfile.mkstemp(prefix="ovtext_", suffix=".txt")
+    with os.fdopen(handle, "w", encoding="utf-8") as fh:
+        fh.write(overlay.text)
+
+    chain = [
+        f"fontfile='{esc_path(overlay.font_file)}'",
+        f"textfile='{esc_path(txt_path)}'",
+        "expansion=none",
+        f"fontsize={size}",
+        f"fontcolor={color(overlay.color, 'white')}",
+    ]
+    if overlay.outline_width > 0:
+        chain.append(f"bordercolor={color(overlay.outline_color, 'black')}")
+        chain.append(f"borderw={overlay.outline_width}")
+    if overlay.box:
+        chain.append("box=1")
+        chain.append(f"boxcolor={color(overlay.box_color, 'black@0.55')}")
+        chain.append("boxborderw=14")
+    else:
+        chain.append("box=0")
+    # Centre-anchored, same convention as the browser preview.
+    chain.append(f"x='{overlay.x:.5f}*w-text_w/2'")
+    chain.append(f"y='{overlay.y:.5f}*h-text_h/2'")
+    chain.append(f"enable='{_overlay_enable(overlay)}'")
+
+    return "drawtext=" + ":".join(chain), txt_path
+
+
+def _apply_overlays(
+    chains: list[str],
+    current: str,
+    overlays: list[Overlay],
+    out_w: int,
+    out_h: int,
+    output_duration: float,
+    next_input_index: int,
+    image_root: Path,
+) -> tuple[str, int, list[str], list[str], list[str]]:
+    """Stack every overlay onto the running video label.
+
+    Returns (label, next_input_index, extra_input_args, temp_files, warnings).
+    Each photo needs its own `-i`, so the input counter is threaded through and
+    handed back for whatever runs next.
+    """
+    extra_inputs: list[str] = []
+    temp_files: list[str] = []
+    warnings: list[str] = []
+
+    for n, overlay in enumerate(overlays):
+        out = f"vovl{n}"
+
+        if overlay.kind == "image":
+            if not overlay.image_id or not overlay.image_id.isalnum():
+                warnings.append(f"Overlay {n + 1} has no image id and was skipped.")
+                continue
+            matches = list(image_root.glob(f"{overlay.image_id}.*"))
+            if not matches:
+                warnings.append(
+                    f"Overlay {n + 1} refers to an image that no longer exists."
+                )
+                continue
+
+            # -loop 1 holds a still frame; -t stops the input so an endless
+            # stream cannot keep ffmpeg alive after the video ends.
+            extra_inputs += [
+                "-loop", "1",
+                "-t", f"{output_duration + 1.0:.3f}",
+                "-i", str(matches[0]),
+            ]
+            label = f"ov{n}"
+            chains.append(
+                _image_overlay_chain(overlay, next_input_index, out_w, out_h, label)
+            )
+            # `overlay=` with an equals sign, not `overlay:`. ffmpeg splits a
+            # filter's name from its arguments at the first `=`, so a colon
+            # here makes it look for a filter literally named "overlay:x" and
+            # it rejects the rest as an option list.
+            chains.append(
+                f"{current}[{label}]overlay"
+                f"=x='({overlay.x:.5f}*main_w-overlay_w)/2'"
+                f":y='({overlay.y:.5f}*main_h-overlay_h)/2'"
+                f":format=auto:shortest=0"
+                f":enable='{_overlay_enable(overlay)}'"
+                f"[{out}]"
+            )
+            current = f"[{out}]"
+            next_input_index += 1
+            continue
+
+        built = _text_overlay_chain(overlay, out_w, out_h)
+        if built is None:
+            if overlay.text.strip():
+                warnings.append(
+                    f"Text overlay {n + 1} needs a font file that does not exist, "
+                    f"so it was skipped."
+                )
+            continue
+        filter_str, txt_path = built
+        temp_files.append(txt_path)
+        chains.append(f"{current}{filter_str}[{out}]")
+        current = f"[{out}]"
+
+    return current, next_input_index, extra_inputs, temp_files, warnings
+
+
+# --------------------------------------------------------------------------
 # Assembly
 # --------------------------------------------------------------------------
 
@@ -635,9 +818,12 @@ def build(
 
     # --- watermark needs its own input ----------------------------------
     extra_inputs: list[str] = []
+    temp_files: list[str] = []
+    next_input_index = 1
     wm_file = req.text.watermark_file
     if wm_file and Path(wm_file).exists():
         extra_inputs = ["-i", wm_file]
+        next_input_index = 2
         wm_x, wm_y = _WM_POS.get(req.text.watermark_position, _WM_POS["bottomRight"])
         wm_chain = ""
         if 0 < req.text.watermark_width_pct < 100:
@@ -655,14 +841,46 @@ def build(
         )
         v_labels = ["[vovl]"]
 
-    # --- colour / text / captions ---------------------------------------
-    text_filters, temp_files = _text_chain(req.text, geo.out_w, geo.out_h)
-
+    # --- colour / captions / framing ------------------------------------
     post: list[str] = []
     if geo.fit_filter:
         post.append(geo.fit_filter)
     post += _colour_chain(req.video)
     post += _caption_chain(req.text, geo.out_w, geo.out_h)
+
+    if post:
+        chains.append(f"{v_labels[0]}{','.join(post)}[vbase]")
+        v_labels = ["[vbase]"]
+
+    # --- draggable overlays ---------------------------------------------
+    # After the framing step, so x/y fractions address the delivery frame the
+    # user actually sees, and before the fades, so a fade to black covers them.
+    if req.overlays:
+        (
+            v_labels[0],
+            next_input_index,
+            overlay_inputs,
+            overlay_temps,
+            overlay_warnings,
+        ) = _apply_overlays(
+            chains,
+            v_labels[0],
+            req.overlays,
+            geo.out_w,
+            geo.out_h,
+            output_duration,
+            next_input_index,
+            IMAGE_ROOT,
+        )
+        extra_inputs += overlay_inputs
+        temp_files += overlay_temps
+        warnings += overlay_warnings
+
+    # --- fades and the legacy title -------------------------------------
+    text_filters, temp_files_from_text = _text_chain(req.text, geo.out_w, geo.out_h)
+    temp_files += temp_files_from_text
+
+    post = []
     if req.video.fade_in > 0:
         post.append(
             f"fade=t=in:st=0:d={req.video.fade_in:.3f}:color={color(req.video.fade_color)}"
