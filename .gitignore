@@ -1,0 +1,15 @@
+# Uploaded sources and rendered output (runtime data)
+storage/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
